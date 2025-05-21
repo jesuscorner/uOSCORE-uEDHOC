@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "edhoc_internal.h": "c",
+        "cmath": "cpp"
+    }
+}
