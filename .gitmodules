@@ -1,6 +1,6 @@
 [submodule "versions/tiempos"]
 	path = versions/tiempos
-	url = https://github.com/eriptic/uoscore-uedhoc.git
+	url = https://github.com/jesuscorner/uOSCORE-uEDHOC.git
 [submodule "versions/uoscore-uedhoc"]
 	path = versions/uoscore-uedhoc
-	url = https://github.com/eriptic/uoscore-uedhoc.git
+	url = https://github.com/jesuscorner/uOSCORE-uEDHOC.git
