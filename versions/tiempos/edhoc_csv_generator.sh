@@ -1,7 +1,5 @@
 #!/bin/bash
 # EDHOC Test CSV Generator
-# This script runs multiple EDHOC exchanges between initiator and responder in Docker containers
-# and collects metrics in a CSV file
 
 # Configuration
 NUM_RUNS=100
@@ -12,7 +10,6 @@ INITIATOR_CONTAINER="edhoc-initiator-1"
 
 # Function to clean up when the script exits
 cleanup() {
-    echo "Cleaning up Docker containers..."
     docker stop $RESPONDER_CONTAINER 2>/dev/null
     docker rm $RESPONDER_CONTAINER 2>/dev/null
     docker stop $INITIATOR_CONTAINER 2>/dev/null
@@ -21,48 +18,97 @@ cleanup() {
     exit 0
 }
 
-# Function to start packet capture on the host instead of inside container
+# Function to start packet capture in the initiator container
 start_packet_capture() {
-    echo "Starting packet capture on host machine..."
-    
-    # Install tcpdump if needed
-    if ! command -v tcpdump &> /dev/null; then
-        echo "Installing tcpdump on host..."
-        sudo apt-get update && sudo apt-get install -y tcpdump
-    fi
-    
-    
-    # Run tcpdump on host
-    echo "Starting tcpdump to capture UDP traffic between containers on port 5683..."
-    DOCKER_IFACE="any" 
-    sudo tcpdump -i $DOCKER_IFACE -n -w ./edhoc_capture.pcap &
-    TCPDUMP_PID=$!
-    
-    # Save PID to variable and file for easier termination
-    echo $TCPDUMP_PID > /tmp/edhoc_tcpdump_pid
-    echo "Packet capture started on host with PID: $TCPDUMP_PID"
-    
-    # Wait to ensure capture is ready
-    sleep 3
+  local pcap_file="/tmp/tiempos/m.pcap"
+  local log_file="/tmp/tiempos/tcpdump.log"
+  local pid_file="/tmp/tiempos/tcpdump.pid"
+
+  # Command to be executed inside the container
+  # -U: packet-buffered output.
+  # -Z root: drop privileges after opening capture device.
+  # -vvv: verbose output (for logs).
+  # The filter is single-quoted.
+  # stderr of tcpdump appends to log_file (after initial echo).
+  # PID of tcpdump background process is saved to pid_file.
+  local inner_cmd="mkdir -p /tmp/tiempos && \\
+    rm -f '${pcap_file}' '${log_file}' '${pid_file}' && \\
+    tcpdump -U -Z root -i eth0 ip and udp port 5683 and \( host 192.168.56.101 or host 192.168.56.102 \) -w '${pcap_file}' 2>> '${log_file}' & echo \\$! > '${pid_file}'"
+
+  echo "Attempting to start tcpdump in ${INITIATOR_CONTAINER}..."
+  sudo docker exec "${INITIATOR_CONTAINER}" bash -c "${inner_cmd}"
+
+  if [ $? -ne 0 ]; then
+    sudo docker cp "${INITIATOR_CONTAINER}:${log_file}" "./tcpdump_initiator_stderr_start_failure.log" 2>/dev/null
+    exit 1
+  fi
+
+  # Verify PID file creation and content after a short delay
+  sleep 1 # Give a moment for PID file to be written
+  local pid_check_cmd="cat '${pid_file}'"
+  local captured_pid=$(sudo docker exec "${INITIATOR_CONTAINER}" bash -c "${pid_check_cmd}" 2>/dev/null)
+
+  if [[ -n "$captured_pid" && "$captured_pid" -gt 0 ]]; then
+    echo "Tcpdump started in container with PID ${captured_pid} (according to ${pid_file})."
+  else
+    sudo docker cp "${INITIATOR_CONTAINER}:${log_file}" "./tcpdump_initiator_stderr.log" 2>/dev/null
+    # This could be a fatal error, but script will continue with a warning for now.
+  fi
+  sleep 4 # Total sleep of 5s after exec command.
 }
 
 # Function to stop packet capture
 stop_packet_capture() {
-    echo "Stopping packet capture on host machine..."
+    local pcap_file="/tmp/tiempos/m.pcap"
+    local log_file="/tmp/tiempos/tcpdump.log"
+    local pid_file="/tmp/tiempos/tcpdump.pid"
+    local host_pcap_file="./edhoc_capture.pcap"
+    local host_log_file="./tcpdump_initiator_stderr.log"
+
+    # Command to read PID and send SIGINT
+    # Fallback to pkill if PID file is not found or empty.
+    local stop_cmd="if [ -s '${pid_file}' ]; then \\
+                      TARGET_PID=\\$(cat '${pid_file}'); \\
+                      echo 'Found PID \${TARGET_PID} in ${pid_file}. Sending SIGINT...'; \\
+                      kill -SIGINT \${TARGET_PID}; \\
+                      rm -f '${pid_file}'; \\
+                      echo 'SIGINT sent to PID \${TARGET_PID}.'; \\
+                    else \\
+                      echo 'WARNING: PID file ${pid_file} not found or empty. Trying pkill -f tcpdump as fallback.'; \\
+                      pkill -SIGINT -f 'tcpdump -i eth0.*-w ${pcap_file}'; \\
+                    fi"
     
-    # Stop tcpdump process on host
-    sudo pkill tcpdump 2>/dev/null || true
-    sleep 2
+    sudo docker exec "$INITIATOR_CONTAINER" bash -c "${stop_cmd}"
     
-    # Check if capture file has data
-    PCAP_SIZE=$(stat -c%s "edhoc_capture.pcap" 2>/dev/null || echo "0")
-    if [ "$PCAP_SIZE" -gt "100" ]; then
-        echo "Packet capture successful. File size: $PCAP_SIZE bytes"
+    if [ $? -ne 0 ]; then
+        # This checks the exit status of 'docker exec', not necessarily if kill/pkill succeeded.
+        echo "WARNING: Docker exec command to stop tcpdump finished with non-zero status. Check container if issues persist."
+    fi
+
+    echo "Waiting for tcpdump to flush buffers and write to file (3 seconds)..."
+    sleep 3
+
+    echo "Copying tcpdump log from ${INITIATOR_CONTAINER}:${log_file} to ${host_log_file}..."
+    sudo docker cp "$INITIATOR_CONTAINER:${log_file}" "${host_log_file}"
+    if [ $? -ne 0 ]; then
+        echo "WARNING: Failed to copy tcpdump log from container."
     else
-        echo "Warning: Packet capture file is small or empty. No packets may have been captured."
+        echo "Tcpdump log copied."
+    fi
+
+    echo "Copying pcap file from ${INITIATOR_CONTAINER}:${pcap_file} to ${host_pcap_file}..."
+    sudo docker cp "$INITIATOR_CONTAINER:${pcap_file}" "${host_pcap_file}"
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Failed to copy pcap file from container."
+    else
+        echo "Pcap file copied to ${host_pcap_file}."
+        local actual_size=$(stat -c%s "${host_pcap_file}" 2>/dev/null || echo "0")
+        echo "Size of ${host_pcap_file} on host: ${actual_size} bytes."
+        if [ "${actual_size}" -lt "100" ]; then # Min pcap header is 24 bytes. 100 bytes suggests at least some packets.
+             echo "WARNING: Copied pcap file is very small (${actual_size} bytes). Capture might be empty or incomplete."
+        fi
     fi
 }
-
 
 # Set up trap to catch Ctrl+C and other termination signals
 trap cleanup SIGINT SIGTERM EXIT
@@ -70,21 +116,9 @@ trap cleanup SIGINT SIGTERM EXIT
 # Create CSV header
 echo "Run,M1_total_size,M2_total_size,M3_total_size,M4_total_size,M1_gen_time,M2_gen_time,M3_gen_time,M4_gen_time,Total_Exchange_time,Method" > $CSV_FILE
 
-# Check Docker and docker-compose availability
-if ! command -v docker &> /dev/null; then
-    echo "Error: docker is not installed or not in the PATH"
-    exit 1
-fi
-
-if ! command -v docker compose &> /dev/null; then
-    echo "Error: docker compose is not installed or not in the PATH"
-    exit 1
-fi
-
 # Start responder container
-echo "Starting containers..."
 docker compose up -d
-sleep 5  
+sleep 3
 
 # Check if the containers are running
 if ! docker ps | grep -q $RESPONDER_CONTAINER; then
@@ -97,31 +131,35 @@ if ! docker ps | grep -q $INITIATOR_CONTAINER; then
     exit 1
 fi
 
-# Give responder time to start - don't use -it flags which require TTY
-echo "Starting responder service in container..."
-docker exec $RESPONDER_CONTAINER bash -c "cd /tmp/tiempos/samples/linux_edhoc/responder/ && make clean && make && ./build/responder" &
+# Start responder service
+RESPONDER_LOG_IN_CONTAINER="/tmp/tiempos/responder_exec.log"
+docker exec $RESPONDER_CONTAINER bash -c "cd /tmp/tiempos/samples/linux_edhoc/responder/ && make clean && make && ./build/responder > '${RESPONDER_LOG_IN_CONTAINER}' 2>&1" &
 RESPONDER_PID=$!
 
-echo "Responder initialized at IP $RESPONDER_IP..."
-
-echo "Building initiator..."
+# Build initiator
 docker exec $INITIATOR_CONTAINER bash -c "cd /tmp/tiempos/samples/linux_edhoc/initiator/ && make clean && make"
-echo "Initiator prepared."
 
 # Loop to run initiator multiple times
 for ((i=1; i<=$NUM_RUNS; i++)); do
-    echo "Running test $i of $NUM_RUNS..."
-    
     # Start packet capture for the first run only
-    if [ $NUM_RUNS -eq 1 ]; then
+    if [ "$NUM_RUNS" -eq 1 ]; then
         start_packet_capture
     fi
     
-    # Run initiator in the initiator container
-    echo "Executing initiator in container $INITIATOR_CONTAINER..."
-    FULL_OUTPUT=$(docker exec $INITIATOR_CONTAINER bash -c "cd /tmp/tiempos/samples/linux_edhoc/initiator/ && ./build/initiator 2>&1")
+    INITIATOR_LOG_FILE="./mx_initiator_run.log"
+    RESPONDER_LOG_FILE="./mx_responder_run.log"
+
+    FULL_OUTPUT=$(sudo docker exec $INITIATOR_CONTAINER bash -c "cd /tmp/tiempos/samples/linux_edhoc/initiator/ && ./build/initiator 2>&1")
     
-    if [ $NUM_RUNS -eq 1 ]; then
+    if [ "$NUM_RUNS" -eq 1 ]; then
+        echo "$FULL_OUTPUT" > "$INITIATOR_LOG_FILE"
+        # Copy responder log from the file inside the container
+        sudo docker cp "${RESPONDER_CONTAINER}:${RESPONDER_LOG_IN_CONTAINER}" "${RESPONDER_LOG_FILE}"
+        # Fallback or append docker logs if needed, though the file should be primary
+        # sudo docker logs $RESPONDER_CONTAINER >> "$RESPONDER_LOG_FILE" 2>&1 
+    fi
+
+    if [ "$NUM_RUNS" -eq 1 ]; then
         stop_packet_capture
     fi
     
@@ -132,22 +170,16 @@ for ((i=1; i<=$NUM_RUNS; i++)); do
         # Format: CSV_OUTPUT:M1_size,M2_size,M3_size,M4_size,M1_time,M2_time,M3_time,M4_time,Total_time
         METRICS=$(echo $RUN_RESULT | sed 's/CSV_OUTPUT://g')
         echo "$i,$METRICS" >> $CSV_FILE
-        echo "✓ Success - Data captured"
-        
-        # Print the captured metrics for confirmation
-        echo "   Metrics: $METRICS"
     else
         echo "$i,,,,,,,,," >> $CSV_FILE  # Empty fields for failed run
-        echo "✗ Failed (no metrics data)"
     fi
     
-    # Short pause between runs
     sleep 1
 done
 
-# Tests are now complete
-echo "All tests completed successfully!"
 echo "Results saved to $CSV_FILE"
+
+
 
 # Generate more detailed statistics
 if [ -f "$CSV_FILE" ]; then
@@ -212,14 +244,6 @@ if [ -f "$CSV_FILE" ]; then
             echo "Average exchange time: $AVG_TOTAL_TIME ms"
             echo "Minimum exchange time: $MIN_TOTAL_TIME ms"
             echo "Maximum exchange time: $MAX_TOTAL_TIME ms"
-            
-            # Calculate M3's percentage of total time (likely the most time-consuming part)
-            if [ "$AVG_M3_TIME" != "N/A" ] && [ "$AVG_TOTAL_TIME" != "N/A" ]; then
-                M3_PERCENTAGE=$(awk -v m3="$AVG_M3_TIME" -v total="$AVG_TOTAL_TIME" 'BEGIN {printf "%.1f", (m3/total)*100}')
-                echo ""
-                echo "M3 represents approximately $M3_PERCENTAGE% of the total exchange time"
-                echo "(This is expected due to the intensive cryptographic operations in M3)"
-            fi
             
             echo ""
             echo "Capture Information:"
