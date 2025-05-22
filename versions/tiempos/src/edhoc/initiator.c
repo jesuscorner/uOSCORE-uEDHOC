@@ -39,6 +39,7 @@
 #include "cbor/edhoc_encode_message_1.h"
 #include "cbor/edhoc_decode_message_2.h"
 #include "cbor/edhoc_encode_message_3.h"
+#include "cbor/cbor_print_message_1.h" // Include the new header
 
 /** 
  * @brief   			Parses message 2.
@@ -161,6 +162,10 @@ enum err msg1_gen(const struct edhoc_initiator_context *c,
 					 &payload_len_out),
 		   0);
 	rc->msg.len = (uint32_t)payload_len_out;
+
+#ifdef DEBUG_PRINT
+	cbor_print_message_1(rc->msg.ptr, rc->msg.len);
+#endif
 
 	TRY(get_suite((enum suite_label)c->suites_i.ptr[c->suites_i.len - 1],
 		      &rc->suite));

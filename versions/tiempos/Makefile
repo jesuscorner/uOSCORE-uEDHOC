@@ -40,6 +40,7 @@ C_SOURCES += src/cbor/edhoc_decode_ptxt3sig.c
 C_SOURCES += src/cbor/edhoc_encode_ptxt3psk.c
 C_SOURCES += src/cbor/edhoc_encode_bstr_type.c
 C_SOURCES += src/cbor/edhoc_encode_data_2.c
+C_SOURCES += src/cbor/cbor_print_message_1.c
 
 
 #$(info    \n C_SOURCES is $(C_SOURCES))
