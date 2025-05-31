@@ -2,11 +2,37 @@
 # EDHOC Test CSV Generator
 
 # Configuration
-NUM_RUNS=100
+NUM_RUNS=1
 CSV_FILE="edhoc_results.csv"
 DOCKER_NETWORK="edhoc_network"
 RESPONDER_CONTAINER="edhoc-responder-1"
 INITIATOR_CONTAINER="edhoc-initiator-1"
+
+# Function to wait for responder to complete processing
+wait_for_responder_completion() {
+    local max_wait=10
+    local wait_count=0
+    
+    echo "Waiting for responder to complete EDHOC processing..."
+    
+    while [ $wait_count -lt $max_wait ]; do
+        # Check if the responder log contains completion indicators
+        local log_check=$(docker exec $RESPONDER_CONTAINER bash -c "tail -5 '${RESPONDER_LOG_IN_CONTAINER}' 2>/dev/null" | grep -E "(K_4|EDHOC.*complete|exchange.*complete)" || true)
+        
+        if [ -n "$log_check" ]; then
+            echo "Responder appears to have completed processing"
+            sleep 1  # Extra second for buffer flush
+            break
+        fi
+        
+        sleep 1
+        wait_count=$((wait_count + 1))
+    done
+    
+    if [ $wait_count -eq $max_wait ]; then
+        echo "WARNING: Responder completion not detected within ${max_wait} seconds"
+    fi
+}
 
 # Function to clean up when the script exits
 cleanup() {
@@ -133,7 +159,8 @@ fi
 
 # Start responder service
 RESPONDER_LOG_IN_CONTAINER="/tmp/tiempos/responder_exec.log"
-docker exec $RESPONDER_CONTAINER bash -c "cd /tmp/tiempos/samples/linux_edhoc/responder/ && make clean && make && ./build/responder > '${RESPONDER_LOG_IN_CONTAINER}' 2>&1" &
+# Use stdbuf to disable output buffering and ensure immediate writes
+docker exec $RESPONDER_CONTAINER bash -c "cd /tmp/tiempos/samples/linux_edhoc/responder/ && make clean && make && stdbuf -o0 -e0 ./build/responder > '${RESPONDER_LOG_IN_CONTAINER}' 2>&1" &
 RESPONDER_PID=$!
 
 # Build initiator
@@ -153,10 +180,34 @@ for ((i=1; i<=$NUM_RUNS; i++)); do
     
     if [ "$NUM_RUNS" -eq 1 ]; then
         echo "$FULL_OUTPUT" > "$INITIATOR_LOG_FILE"
+        
+        # Wait for responder to complete processing
+        wait_for_responder_completion
+        
+        # Give the responder time to finish writing and flush buffers
+        echo "Waiting for responder to complete logging..."
+        sleep 3
+        
+        # Force flush of any remaining buffers in the responder process
+        docker exec $RESPONDER_CONTAINER bash -c "sync" 2>/dev/null || true
+        
         # Copy responder log from the file inside the container
         sudo docker cp "${RESPONDER_CONTAINER}:${RESPONDER_LOG_IN_CONTAINER}" "${RESPONDER_LOG_FILE}"
-        # Fallback or append docker logs if needed, though the file should be primary
-        # sudo docker logs $RESPONDER_CONTAINER >> "$RESPONDER_LOG_FILE" 2>&1 
+        
+        # Verify the log file size and warn if it seems incomplete
+        if [ -f "$RESPONDER_LOG_FILE" ]; then
+            local log_size=$(wc -l < "$RESPONDER_LOG_FILE")
+            echo "Responder log copied with $log_size lines"
+            
+            # Check if the log ends abruptly (missing expected completion markers)
+            local last_line=$(tail -1 "$RESPONDER_LOG_FILE")
+            if [[ "$last_line" == *"K_"* ]] && [[ ! "$last_line" == *"K_4"* ]]; then
+                echo "WARNING: Responder log appears to be incomplete (ends with partial key output)"
+                # Try to get any remaining output from docker logs as fallback
+                echo "Attempting to capture additional output from docker logs..."
+                sudo docker logs $RESPONDER_CONTAINER 2>&1 | tail -20 >> "${RESPONDER_LOG_FILE}_docker_fallback.log"
+            fi
+        fi
     fi
 
     if [ "$NUM_RUNS" -eq 1 ]; then
